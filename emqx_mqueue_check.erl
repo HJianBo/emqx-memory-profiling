@@ -7,6 +7,7 @@
 %%       batch_size => 1000,
 %%       interval_ms => 1000,
 %%       max_full_scans => 2,
+%%       max_client_summary => 120000,
 %%       nodes => cluster, %% cluster | local | [node()]
 %%       rpc_timeout_ms => 10000,
 %%       load_remote_module => true,
@@ -78,6 +79,7 @@ default_cfg() ->
         batch_size => 1000,
         interval_ms => 1000,
         max_full_scans => 2,
+        max_client_summary => 120000,
         nodes => cluster,
         rpc_timeout_ms => 10000,
         load_remote_module => true,
@@ -90,6 +92,7 @@ normalize_cfg(Cfg0) ->
         batch_size := pos_int(maps:get(batch_size, Cfg0), 1000),
         interval_ms := pos_int(maps:get(interval_ms, Cfg0), 1000),
         rpc_timeout_ms := pos_int(maps:get(rpc_timeout_ms, Cfg0), 10000),
+        max_client_summary := pos_int(maps:get(max_client_summary, Cfg0), 120000),
         max_full_scans := max_scans(maps:get(max_full_scans, Cfg0))
     }.
 
@@ -116,7 +119,7 @@ init(Cfg0, Parent) ->
     ok = append_log(
         Cfg,
         "~p start pid=~w node=~w tab=~w batch_size=~w interval_ms=~w max_full_scans=~w "
-        "rpc_timeout_ms=~w requested_nodes=~p scan_nodes=~p skipped_nodes=~p "
+        "max_client_summary=~w rpc_timeout_ms=~w requested_nodes=~p scan_nodes=~p skipped_nodes=~p "
         "remote_module_load=~p log=~s~n",
         [
             now_ms(),
@@ -126,6 +129,7 @@ init(Cfg0, Parent) ->
             maps:get(batch_size, Cfg),
             maps:get(interval_ms, Cfg),
             maps:get(max_full_scans, Cfg),
+            maps:get(max_client_summary, Cfg),
             maps:get(rpc_timeout_ms, Cfg),
             RequestedNodes,
             Nodes,
@@ -164,6 +168,8 @@ tick(Cfg, State) ->
             {continue, State1};
         {scan_done, State1} ->
             finish_scan(Cfg, State1);
+        {stop, State1} ->
+            {stop, State1};
         {fatal, Reason, State1} ->
             append_log(Cfg, "~p fatal reason=~p~n", [now_ms(), Reason]),
             {stop, State1#{last_error => Reason}}
@@ -363,16 +369,22 @@ scan_batch(Cfg, State) ->
     case Res of
         {ok, Batch, NextCursor, Done} ->
             State1 = process_batch_result(Cfg, Node, Batch, State),
-            case Done of
+            case client_summary_limit_reached(Cfg, State1) of
                 true ->
-                    State2 = mark_node_done(Cfg, Node, State1#{pending_nodes := RestNodes}),
-                    continue_or_finish(State2);
+                    ok = log_client_summary_limit(Cfg, Node, State1),
+                    finish_scan(Cfg, State1#{pending_nodes := []}, true);
                 false ->
-                    Cursors1 = maps:put(Node, NextCursor, maps:get(node_cursors, State1)),
-                    {continue, State1#{
-                        pending_nodes := RestNodes ++ [Node],
-                        node_cursors := Cursors1
-                    }}
+                    case Done of
+                        true ->
+                            State2 = mark_node_done(Cfg, Node, State1#{pending_nodes := RestNodes}),
+                            continue_or_finish(State2);
+                        false ->
+                            Cursors1 = maps:put(Node, NextCursor, maps:get(node_cursors, State1)),
+                            {continue, State1#{
+                                pending_nodes := RestNodes ++ [Node],
+                                node_cursors := Cursors1
+                            }}
+                    end
             end;
         {rpc_error, Reason} ->
             State1 = mark_node_error(Cfg, Node, Reason, State#{pending_nodes := RestNodes}),
@@ -538,8 +550,9 @@ process_batch_result(Cfg, Node, Batch, State) ->
     BatchNo = maps:get(batch_no, State) + 1,
     Stats0 = maps:get(stats, State),
     Stats1 = merge_batch_stats(Stats0, Batch),
+    MaxSummary = maps:get(max_client_summary, Cfg),
     Summary1 = lists:reverse(
-        compact_clients_with_node(Node, Batch),
+        limited_compact_clients_with_node(Node, Batch, summary_room(MaxSummary, State)),
         maps:get(client_summary, State, [])
     ),
     ok = log_batch_hits(Cfg, Node, ScanNo, BatchNo, maps:get(hits, Batch)),
@@ -550,6 +563,14 @@ process_batch_result(Cfg, Node, Batch, State) ->
     }),
     ok = maybe_log_batch(Cfg, Node, ScanNo, BatchNo, Batch, Stats1, State1),
     State1.
+
+summary_room(MaxSummary, State) ->
+    MaxSummary - length(maps:get(client_summary, State, [])).
+
+limited_compact_clients_with_node(_Node, _Batch, Room) when Room =< 0 ->
+    [];
+limited_compact_clients_with_node(Node, Batch, Room) ->
+    lists:sublist(compact_clients_with_node(Node, Batch), Room).
 
 merge_batch_stats(Stats0, Batch) ->
     Stats0#{
@@ -575,6 +596,23 @@ log_batch_hits(_Cfg, _Node, _ScanNo, _BatchNo, []) ->
 log_batch_hits(Cfg, Node, ScanNo, BatchNo, [Client | Rest]) ->
     ok = log_hit(Cfg, Node, ScanNo, BatchNo, Client),
     log_batch_hits(Cfg, Node, ScanNo, BatchNo, Rest).
+
+client_summary_limit_reached(Cfg, State) ->
+    length(maps:get(client_summary, State, [])) >= maps:get(max_client_summary, Cfg).
+
+log_client_summary_limit(Cfg, Node, State) ->
+    append_log(
+        Cfg,
+        "~p limit_reached reason=max_client_summary scan=~w node=~w count=~w limit=~w "
+        "status=stop_scan~n",
+        [
+            now_ms(),
+            maps:get(scan_no, State),
+            Node,
+            length(maps:get(client_summary, State, [])),
+            maps:get(max_client_summary, Cfg)
+        ]
+    ).
 
 bool_int(true) -> 1;
 bool_int(false) -> 0.
@@ -604,6 +642,9 @@ stat_value(_, _, Default) ->
     Default.
 
 finish_scan(Cfg, State) ->
+    finish_scan(Cfg, State, false).
+
+finish_scan(Cfg, State, ForceStop) ->
     Done = maps:get(done_scans, State) + 1,
     ScanNo = maps:get(scan_no, State),
     Stats = maps:get(stats, State),
@@ -635,12 +676,12 @@ finish_scan(Cfg, State) ->
     ),
     ok = log_client_summary(Cfg, ScanNo, ClientSummary),
     State1 = State#{done_scans := Done},
-    case reached_max_scans(Cfg, Done) of
+    case ForceStop orelse reached_max_scans(Cfg, Done) of
         true ->
             append_log(
                 Cfg,
-                "~p all_done done_scans=~w max_full_scans=~w pid=~w~n",
-                [now_ms(), Done, maps:get(max_full_scans, Cfg), self()]
+                "~p all_done done_scans=~w max_full_scans=~w force_stop=~w pid=~w~n",
+                [now_ms(), Done, maps:get(max_full_scans, Cfg), ForceStop, self()]
             ),
             {stop, State1};
         false ->
@@ -750,6 +791,7 @@ public_status(Cfg, State) ->
         batch_size => maps:get(batch_size, Cfg),
         interval_ms => maps:get(interval_ms, Cfg),
         max_full_scans => maps:get(max_full_scans, Cfg),
+        max_client_summary => maps:get(max_client_summary, Cfg),
         rpc_timeout_ms => maps:get(rpc_timeout_ms, Cfg),
         requested_nodes => maps:get(requested_nodes, Cfg, maps:get(nodes, Cfg)),
         nodes => maps:get(nodes, Cfg),
